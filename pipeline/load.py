@@ -1,29 +1,25 @@
 """Load stage: write transformed matches into partitioned Parquet via DuckDB.
 
-Storage is `data/matches/year=YYYY/*.parquet` (Hive-style partitioning by the
-match's year), queried through DuckDB as an OLAP engine rather than a
-row-oriented database.
+Storage is `data/matches/year=YYYY/*.parquet`, partitioned Hive-style by
+match year and queried through DuckDB.
 
-Parquet files have no UNIQUE constraint, so idempotency (re-running the
-pipeline never duplicates rows) is achieved differently than the old SQLite
-upsert: for every year touched by the incoming batch, read that year's
-existing partition, drop any existing row whose natural key is about to be
-replaced (an anti-join), union in the incoming rows for that year, and
-rewrite the whole year=YYYY/ partition from that result. Partitions the
-batch doesn't touch are never read or rewritten. Running the same batch
-through `load()` twice produces the same union both times, so the row count
-is stable across repeated runs.
+Parquet has no UNIQUE constraint, so idempotency comes from a per-partition
+rewrite: for every year touched by the incoming batch, read that year's
+existing partition, drop any row whose natural key is about to be replaced
+(an anti-join), union in the incoming rows, and rewrite the whole
+year=YYYY/ partition from the result. Untouched partitions are never read
+or rewritten. Running the same batch through `load()` twice produces the
+same union both times, so the row count stays stable across repeated runs.
 
-Normal runs only touch rows at or after (MAX(date) across all partitions -
-a trailing window), since the Kaggle source updates daily and can
-retroactively correct recent results/rankings. `--full-refresh` reprocesses
-every row (and therefore every year partition).
+Normal runs only touch rows at or after MAX(date) minus a trailing window,
+since the Kaggle source updates daily and can retroactively correct recent
+results and rankings. `--full-refresh` reprocesses every row.
 
-Natural key is (date, tournament, round, player_1, player_2) -- `round` is
-required because round-robin events (e.g. the Masters Cup) can have the same
-two players meet twice on the same date within the same tournament (round
-robin, then final), with different results. Without `round` those two real
-matches collide and one silently overwrites the other.
+Natural key is (date, tournament, round, player_1, player_2). `round` is
+part of the key because round-robin events (e.g. the Masters Cup) can have
+the same two players meet twice on the same date in the same tournament,
+once in round robin and once in the final, with different results.
+Dropping `round` would collide those two matches into one.
 """
 import argparse
 import logging
@@ -56,11 +52,10 @@ _COLUMN_MAP = {
 _COLUMNS = list(_COLUMN_MAP.values())
 _KEY_COLUMNS = ('date', 'tournament', 'round', 'player_1', 'player_2')
 
-# Explicit target types (not inferred) for every column written to Parquet.
-# `year` is derived from `date` and used only to route rows to a partition
-# directory (year=YYYY/); it is deliberately re-projected away before the
-# final write (see _write_year_partition) so it never lands in the on-disk
-# schema below.
+# Explicit target type for every column written to Parquet. `year` is
+# derived from `date` to route rows to a partition directory (year=YYYY/)
+# and is projected away before the final write (see _write_year_partition),
+# so it never lands in the on-disk schema below.
 _COLUMN_TYPES = {
     'date': 'DATE', 'tournament': 'VARCHAR', 'series': 'VARCHAR',
     'court': 'VARCHAR', 'surface': 'VARCHAR', 'round': 'VARCHAR',
@@ -71,25 +66,23 @@ _COLUMN_TYPES = {
     'pts_diff': 'INTEGER', 'form_1': 'DOUBLE', 'form_2': 'DOUBLE',
 }
 # SELECT list that casts every incoming column to its explicit type, plus
-# `year` (kept as a real column here so anti-join/union queries can filter
-# and group on it; only the final COPY's PARTITION_BY strips it from disk).
+# `year`. `year` is kept here so the anti-join/union queries can filter and
+# group on it; _write_year_partition drops it before the final write.
 _TYPED_SELECT_SQL = ', '.join(
     f'CAST({col} AS {_COLUMN_TYPES[col]}) AS {col}' for col in _COLUMNS
 ) + ', CAST(year AS INTEGER) AS year'
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
-    """DuckDB is a pure query engine here -- there's no database file to
-    open, Parquet under MATCHES_DIR is the storage. The connection is
-    in-memory; it just needs to exist before MATCHES_DIR does."""
+    """DuckDB acts as a query engine over the Parquet files under
+    MATCHES_DIR; the connection itself is in-memory."""
     MATCHES_DIR.mkdir(parents=True, exist_ok=True)
     return duckdb.connect()
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    """No persistent schema object for Parquet -- explicit column types are
-    enforced by the CAST in _TYPED_SELECT_SQL every time a partition is
-    written, not by a stored DDL statement."""
+    """Parquet has no schema DDL to create. Column types are enforced by
+    the CAST in _TYPED_SELECT_SQL each time a partition is written."""
     MATCHES_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -140,9 +133,9 @@ def _existing_partition(
 def _write_year_partition(
     conn: duckdb.DuckDBPyConnection, year: int, rows: duckdb.DuckDBPyRelation
 ) -> None:
-    """Rewrite year=Y/ from `rows` (the full replacement content for that
-    year) via a temp-dir-then-swap so a crash mid-write can't leave the
-    partition half-overwritten."""
+    """Rewrite year=Y/ from `rows`, the full replacement content for that
+    year. Writes to a temp dir first and swaps it in, so a crash mid-write
+    can't leave the partition half-overwritten."""
     tmp_root = Path(tempfile.mkdtemp(dir=MATCHES_DIR, prefix='.tmp-write-'))
     try:
         conn.execute(f"""
@@ -150,12 +143,11 @@ def _write_year_partition(
             (FORMAT PARQUET, PARTITION_BY (year), OVERWRITE_OR_IGNORE true)
         """)
 
-        # DuckDB's Parquet writer doesn't strip the PARTITION_BY column from
-        # the files it writes the way its CSV writer does (open bug as of
-        # 1.5.5: github.com/duckdb/duckdb/issues/12147), so `year` would
-        # otherwise be stored redundantly inside year=Y/ on top of being
-        # encoded in the directory name. Re-project it away so the on-disk
-        # schema matches _COLUMN_TYPES (20 columns) exactly.
+        # DuckDB's Parquet writer leaves the PARTITION_BY column in the
+        # files it writes (open bug as of 1.5.5:
+        # github.com/duckdb/duckdb/issues/12147), storing `year` twice:
+        # once in the directory name, once inside the file. Re-project it
+        # away so the on-disk schema matches _COLUMN_TYPES exactly.
         value_cols = ', '.join(_COLUMNS)
         raw_glob = tmp_root / f'year={year}' / '*.parquet'
         pattern = str(raw_glob).replace("'", "''")

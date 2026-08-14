@@ -5,18 +5,16 @@ from sklearn.metrics import accuracy_score
 
 from pipeline.config import MATCHES_DIR
 
-# Only the columns the model reads below -- not odd_1/odd_2, score,
-# tournament, series, or round. Parquet is columnar, so a column that isn't
-# named here is never read off disk at all: DuckDB only opens the column
-# chunks for the columns listed in the SELECT, unlike a row store (SQLite)
-# where every row is read whole regardless of which columns you keep.
+# Selects only the columns the model reads below, skipping odd_1/odd_2,
+# score, tournament, series, and round. Parquet is columnar, so DuckDB only
+# opens the column chunks named in the SELECT; a row store like SQLite
+# reads every column of every row regardless.
 #
 # rank_1/rank_2/pts_1/pts_2/rank_diff/pts_diff are stored as nullable
-# INTEGER (see pipeline/load.py) -- correct for storage, but read straight
-# through, DuckDB hands nullable integers back to pandas as nullable Int32
-# (pd.NA) rather than the float64/NaN the old SQLite-backed query produced.
-# Cast them to DOUBLE here so the DataFrame handed to sklearn has the same
-# dtypes as before; the nullable-int storage type is unaffected.
+# INTEGER (see pipeline/load.py). DuckDB reads those into pandas as
+# nullable Int32 with pd.NA. Casting to DOUBLE here keeps the DataFrame's
+# dtypes matching what the old SQLite-backed query produced (float64/NaN);
+# the Parquet storage type is unaffected.
 def build_query(matches_dir=MATCHES_DIR) -> str:
     return f"""
     SELECT

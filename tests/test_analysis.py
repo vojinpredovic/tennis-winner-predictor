@@ -6,11 +6,11 @@ import pipeline.load as load_module
 from analysis import load_features
 from pipeline.load import load
 
-# Dtypes the old SQLite-backed query produced (verified against
-# data/tennis.db before the migration): sqlite3 has no integer-with-nulls
+# Dtypes the old SQLite-backed query produced, verified against
+# data/tennis.db before the migration. sqlite3 has no integer-with-nulls
 # storage class, so anything nullable came back as float64/NaN.
 # analysis.py's DuckDB query casts to match this contract even though the
-# underlying Parquet storage now uses genuine nullable integers -- see the
+# underlying Parquet storage now uses genuine nullable integers. See the
 # comment above build_query() in analysis.py.
 _EXPECTED_DTYPES = {
     'Surface': 'str',

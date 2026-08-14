@@ -1,38 +1,34 @@
 """Compare a date-filtered aggregate query against the old SQLite table and
-the new partitioned-Parquet dataset, and show DuckDB's query plan for the
-Parquet side so partition pruning is visible, not just asserted.
+the new partitioned Parquet dataset, and show DuckDB's query plan so
+partition pruning is visible.
 
 Why a columnar, partitioned layout scans less data for this query shape:
 
-  Row store (SQLite): a table is stored row by row, so "give me `surface`
-  and `date` for 2015-2020" still has to walk every row of the whole table
-  and pull every column along with it -- there's no way to read only the
-  two columns you asked for, or skip the years you didn't.
+  Row store (SQLite): a table is stored row by row. Getting `surface` and
+  `date` for 2015-2020 means walking every row of the whole table and
+  pulling every column along with it.
 
-  Columnar + partitioned (DuckDB/Parquet): two independent prunings stack:
-    1. Partition pruning (directory-level): rows are physically segregated
-       into year=YYYY/ directories, so a predicate on `year` (the partition
-       key) lets DuckDB decide which *files* to open before reading a
-       single byte of data -- unmatched years are never touched.
-    2. Column pruning (file-level): within each file opened, Parquet stores
-       column values contiguously (not row by row), so DuckDB reads only
-       the column chunks the query actually selects/filters on.
-  The combination means a query like this one touches a small fraction of
-  the bytes on disk that the equivalent SQLite scan does, in principle --
-  see the caveat below on why that doesn't show up as a speed win yet.
+  Columnar + partitioned (DuckDB/Parquet): two prunings stack.
+    1. Partition pruning, at the directory level: rows live in year=YYYY/
+       directories, so a predicate on `year` lets DuckDB pick which files
+       to open before reading any data.
+    2. Column pruning, at the file level: Parquet stores column values
+       contiguously, so DuckDB reads only the column chunks the query
+       selects or filters on.
+  Together, a query like this one touches a small fraction of the bytes on
+  disk the equivalent SQLite scan does. See the caveat at the end for why
+  that doesn't show up as a speed win at this dataset's size.
 
-Note: the query below filters on `year` (the Hive partition column DuckDB
-exposes automatically), not on `date`, because that's what triggers
-directory-level pruning here. Filtering on `date` instead still prunes,
-but only via each Parquet file's min/max row-group statistics, which
-requires opening every file's metadata first -- a weaker, file-content-level
-form of pruning, not the partition-directory pruning this script wants to
-demonstrate.
+Note: the query below filters on `year`, the Hive partition column DuckDB
+exposes automatically, since that's what triggers directory-level pruning.
+Filtering on `date` also prunes, but through each file's min/max row-group
+statistics, which requires opening every file's metadata first, a weaker
+form of pruning than the directory-level pruning this script demonstrates.
 
-Prerequisites: run `python -m pipeline.run` on this branch (for the Parquet
-side) and, separately, checkout `sqlite-load` and run the pipeline there
-(for `data/tennis.db`, the SQLite side) -- `data/` is gitignored so both
-outputs can coexist locally.
+Prerequisites: run `python -m pipeline.run` on this branch to build the
+Parquet dataset. Separately, checkout `sqlite-load` and run the pipeline
+there to produce `data/tennis.db`. `data/` is gitignored, so both outputs
+can coexist locally.
 """
 import json
 import sqlite3
@@ -133,10 +129,9 @@ def main() -> None:
     total_partitions = len(list(MATCHES_DIR.glob('year=*')))
     print(
         f'Partition pruning: DuckDB scanned '
-        f'{scan["extra_info"]["Scanning Files"]} year partitions '
-        f'(dataset spans {total_partitions} years total, query asked for '
-        f'{YEAR_END - YEAR_START + 1}) -- the other partitions were never '
-        f'opened.\n'
+        f'{scan["extra_info"]["Scanning Files"]} year partitions. '
+        f'The dataset spans {total_partitions} years; the query asked for '
+        f'{YEAR_END - YEAR_START + 1}, and the rest were never opened.\n'
     )
 
     print('EXPLAIN ANALYZE (DuckDB, human-readable):')
@@ -145,16 +140,15 @@ def main() -> None:
 
     print(
         '\nCaveat: at ~68k rows (a few MB of Parquet), both queries finish '
-        'in low single-digit milliseconds -- there is no meaningful speed '
-        'difference to report here, and it would be misleading to imply '
-        'one. What this benchmark demonstrates is the *access pattern*: '
-        'DuckDB opened 6 of 27 files and read only the `surface`/`year` '
-        'columns it needed, while SQLite scanned the whole table row by '
-        'row. That gap in bytes touched is real even when the wall-clock '
-        'gap is not -- it becomes a real time difference at a dataset size '
-        'where "bytes touched" is the bottleneck (many partitions, wide '
-        'tables, remote/cold storage), which this 68k-row single-node '
-        'dataset is far too small to be.'
+        'in low single-digit milliseconds. There is no meaningful speed '
+        'difference to report here. What this benchmark demonstrates is '
+        'the access pattern: DuckDB opened 6 of 27 files and read only the '
+        '`surface`/`year` columns it needed, while SQLite scanned the '
+        'whole table row by row. That gap in bytes touched becomes a real '
+        'time difference at a dataset size where bytes touched is the '
+        'bottleneck: many partitions, wide tables, or storage far from '
+        'compute. This 68k-row single-node dataset is far too small for '
+        'that.'
     )
 
 

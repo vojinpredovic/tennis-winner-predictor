@@ -135,8 +135,8 @@ def test_natural_key_uniqueness_assertion_fires_on_duplicate_input(
 def test_load_treats_same_day_rematch_as_two_distinct_rows(
     matches_dir, conn
 ):
-    # Same two players, same date, same tournament, different round -- a
-    # round-robin-then-final scenario. Without `round` in the natural key
+    # Same two players, same date, same tournament, different round: a
+    # round-robin-then-final scenario. Without `round` in the natural key,
     # these would collide and one match would silently overwrite the other.
     df = pd.DataFrame({
         'Date': pd.to_datetime(['2024-01-01', '2024-01-01']),
