@@ -1,8 +1,23 @@
-"""Load stage: write transformed matches into SQLite with an idempotent upsert.
+"""Load stage: write transformed matches into partitioned Parquet via DuckDB.
 
-Normal runs only touch rows at or after (MAX(date) in the table - a trailing
-window), since the Kaggle source updates daily and can retroactively correct
-recent results/rankings. `--full-refresh` reprocesses every row.
+Storage is `data/matches/year=YYYY/*.parquet` (Hive-style partitioning by the
+match's year), queried through DuckDB as an OLAP engine rather than a
+row-oriented database.
+
+Parquet files have no UNIQUE constraint, so idempotency (re-running the
+pipeline never duplicates rows) is achieved differently than the old SQLite
+upsert: for every year touched by the incoming batch, read that year's
+existing partition, drop any existing row whose natural key is about to be
+replaced (an anti-join), union in the incoming rows for that year, and
+rewrite the whole year=YYYY/ partition from that result. Partitions the
+batch doesn't touch are never read or rewritten. Running the same batch
+through `load()` twice produces the same union both times, so the row count
+is stable across repeated runs.
+
+Normal runs only touch rows at or after (MAX(date) across all partitions -
+a trailing window), since the Kaggle source updates daily and can
+retroactively correct recent results/rankings. `--full-refresh` reprocesses
+every row (and therefore every year partition).
 
 Natural key is (date, tournament, round, player_1, player_2) -- `round` is
 required because round-robin events (e.g. the Masters Cup) can have the same
@@ -12,49 +27,23 @@ matches collide and one silently overwrites the other.
 """
 import argparse
 import logging
-import sqlite3
+import shutil
+import tempfile
+import time
 from datetime import timedelta
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 
-from pipeline.config import DB_PATH, RAW_CSV_PATH
+from pipeline.config import MATCHES_DIR, RAW_CSV_PATH
 from pipeline.transform import transform
 
 logger = logging.getLogger(__name__)
 
 RELOAD_TRAILING_DAYS = 7
 
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS matches (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    date        TEXT    NOT NULL,
-    tournament  TEXT    NOT NULL,
-    series      TEXT,
-    court       TEXT,
-    surface     TEXT,
-    round       TEXT,
-    best_of     INTEGER,
-    player_1    TEXT    NOT NULL,
-    player_2    TEXT    NOT NULL,
-    winner      TEXT    NOT NULL,
-    rank_1      INTEGER,
-    rank_2      INTEGER,
-    pts_1       INTEGER,
-    pts_2       INTEGER,
-    odd_1       REAL,
-    odd_2       REAL,
-    score       TEXT,
-    rank_diff   INTEGER,
-    pts_diff    INTEGER,
-    form_1      REAL    NOT NULL,
-    form_2      REAL    NOT NULL,
-    UNIQUE (date, tournament, round, player_1, player_2)
-)
-"""
-_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(date)"
-
-# DataFrame column -> matches table column
+# DataFrame column -> matches column
 _COLUMN_MAP = {
     'Date': 'date', 'Tournament': 'tournament', 'Series': 'series',
     'Court': 'court', 'Surface': 'surface', 'Round': 'round',
@@ -66,81 +55,200 @@ _COLUMN_MAP = {
 }
 _COLUMNS = list(_COLUMN_MAP.values())
 _KEY_COLUMNS = ('date', 'tournament', 'round', 'player_1', 'player_2')
-_KEY_INDICES = [_COLUMNS.index(c) for c in _KEY_COLUMNS]
-_INT_COLUMNS = {
-    'best_of', 'rank_1', 'rank_2', 'pts_1', 'pts_2', 'rank_diff', 'pts_diff',
+
+# Explicit target types (not inferred) for every column written to Parquet.
+# `year` is derived from `date` and used only to route rows to a partition
+# directory (year=YYYY/); it is deliberately re-projected away before the
+# final write (see _write_year_partition) so it never lands in the on-disk
+# schema below.
+_COLUMN_TYPES = {
+    'date': 'DATE', 'tournament': 'VARCHAR', 'series': 'VARCHAR',
+    'court': 'VARCHAR', 'surface': 'VARCHAR', 'round': 'VARCHAR',
+    'best_of': 'INTEGER', 'player_1': 'VARCHAR', 'player_2': 'VARCHAR',
+    'winner': 'VARCHAR', 'rank_1': 'INTEGER', 'rank_2': 'INTEGER',
+    'pts_1': 'INTEGER', 'pts_2': 'INTEGER', 'odd_1': 'DOUBLE',
+    'odd_2': 'DOUBLE', 'score': 'VARCHAR', 'rank_diff': 'INTEGER',
+    'pts_diff': 'INTEGER', 'form_1': 'DOUBLE', 'form_2': 'DOUBLE',
 }
-_UPDATE_COLUMNS = [c for c in _COLUMNS if c not in _KEY_COLUMNS]
-
-_UPSERT_SQL = f"""
-INSERT INTO matches ({', '.join(_COLUMNS)})
-VALUES ({', '.join('?' for _ in _COLUMNS)})
-ON CONFLICT({', '.join(_KEY_COLUMNS)}) DO UPDATE SET
-    {', '.join(f'{c} = excluded.{c}' for c in _UPDATE_COLUMNS)}
-"""
+# SELECT list that casts every incoming column to its explicit type, plus
+# `year` (kept as a real column here so anti-join/union queries can filter
+# and group on it; only the final COPY's PARTITION_BY strips it from disk).
+_TYPED_SELECT_SQL = ', '.join(
+    f'CAST({col} AS {_COLUMN_TYPES[col]}) AS {col}' for col in _COLUMNS
+) + ', CAST(year AS INTEGER) AS year'
 
 
-def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(db_path)
+def get_connection() -> duckdb.DuckDBPyConnection:
+    """DuckDB is a pure query engine here -- there's no database file to
+    open, Parquet under MATCHES_DIR is the storage. The connection is
+    in-memory; it just needs to exist before MATCHES_DIR does."""
+    MATCHES_DIR.mkdir(parents=True, exist_ok=True)
+    return duckdb.connect()
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(_SCHEMA_SQL)
-    conn.execute(_INDEX_SQL)
-    conn.commit()
+def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
+    """No persistent schema object for Parquet -- explicit column types are
+    enforced by the CAST in _TYPED_SELECT_SQL every time a partition is
+    written, not by a stored DDL statement."""
+    MATCHES_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _prepare_rows(df: pd.DataFrame) -> list[tuple]:
+def _existing_max_date(conn: duckdb.DuckDBPyConnection) -> pd.Timestamp | None:
+    pattern = str(MATCHES_DIR / '**' / '*.parquet')
+    if not any(MATCHES_DIR.glob('year=*/*.parquet')):
+        return None
+    row = conn.execute(
+        "SELECT MAX(date) FROM read_parquet("
+        f"'{pattern}', hive_partitioning=true)"
+    ).fetchone()
+    return pd.Timestamp(row[0]) if row and row[0] is not None else None
+
+
+def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.rename(columns=_COLUMN_MAP)[_COLUMNS].copy()
-    out['date'] = out['date'].dt.strftime('%Y-%m-%d')
+    out['year'] = out['date'].dt.year
+    return out
 
-    def to_py(col: str, val):
-        if pd.isna(val):
-            return None
-        return int(val) if col in _INT_COLUMNS else val
 
-    return [
-        tuple(to_py(col, val) for col, val in zip(_COLUMNS, row))
-        for row in out.itertuples(index=False)
-    ]
+def _assert_natural_key_unique(df: pd.DataFrame) -> None:
+    dup_mask = df.duplicated(subset=list(_KEY_COLUMNS), keep=False)
+    if dup_mask.any():
+        dup_keys = df.loc[dup_mask, list(_KEY_COLUMNS)].drop_duplicates()
+        raise ValueError(
+            f'{len(dup_keys)} duplicate natural key(s) in incoming batch '
+            f'(date, tournament, round, player_1, player_2):\n{dup_keys}'
+        )
+
+
+def _existing_partition(
+    conn: duckdb.DuckDBPyConnection, year: int
+) -> duckdb.DuckDBPyRelation:
+    """Typed relation of every row currently stored in year=Y's partition,
+    or an empty relation with the same schema if that partition doesn't
+    exist yet (a new year in the incoming batch)."""
+    partition_dir = MATCHES_DIR / f'year={year}'
+    if not partition_dir.exists():
+        return conn.sql(f'SELECT {_TYPED_SELECT_SQL} FROM incoming LIMIT 0')
+    pattern = str(partition_dir / '*.parquet').replace("'", "''")
+    value_cols = ', '.join(_COLUMNS)
+    return conn.sql(f"""
+        SELECT {value_cols}, {year} AS year
+        FROM read_parquet('{pattern}')
+    """)
+
+
+def _write_year_partition(
+    conn: duckdb.DuckDBPyConnection, year: int, rows: duckdb.DuckDBPyRelation
+) -> None:
+    """Rewrite year=Y/ from `rows` (the full replacement content for that
+    year) via a temp-dir-then-swap so a crash mid-write can't leave the
+    partition half-overwritten."""
+    tmp_root = Path(tempfile.mkdtemp(dir=MATCHES_DIR, prefix='.tmp-write-'))
+    try:
+        conn.execute(f"""
+            COPY (SELECT * FROM rows) TO '{tmp_root}'
+            (FORMAT PARQUET, PARTITION_BY (year), OVERWRITE_OR_IGNORE true)
+        """)
+
+        # DuckDB's Parquet writer doesn't strip the PARTITION_BY column from
+        # the files it writes the way its CSV writer does (open bug as of
+        # 1.5.5: github.com/duckdb/duckdb/issues/12147), so `year` would
+        # otherwise be stored redundantly inside year=Y/ on top of being
+        # encoded in the directory name. Re-project it away so the on-disk
+        # schema matches _COLUMN_TYPES (20 columns) exactly.
+        value_cols = ', '.join(_COLUMNS)
+        raw_glob = tmp_root / f'year={year}' / '*.parquet'
+        pattern = str(raw_glob).replace("'", "''")
+        cleaned = tmp_root / 'cleaned.parquet'
+        conn.execute(f"""
+            COPY (SELECT {value_cols} FROM read_parquet('{pattern}'))
+            TO '{cleaned}' (FORMAT PARQUET)
+        """)
+
+        target = MATCHES_DIR / f'year={year}'
+        if target.exists():
+            shutil.rmtree(target)
+        target.mkdir()
+        shutil.move(str(cleaned), str(target / 'data_0.parquet'))
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 def load(
-    df: pd.DataFrame, conn: sqlite3.Connection, full_refresh: bool = False
+    df: pd.DataFrame,
+    conn: duckdb.DuckDBPyConnection,
+    full_refresh: bool = False,
 ) -> tuple[int, int]:
-    """Upsert df's rows into the matches table. Returns (inserted, updated)."""
+    """Upsert df's rows into the Parquet dataset.
+
+    Returns (inserted, updated).
+    """
     ensure_schema(conn)
+    t0 = time.monotonic()
 
     if not full_refresh:
-        cutoff = conn.execute('SELECT MAX(date) FROM matches').fetchone()[0]
+        cutoff = _existing_max_date(conn)
         if cutoff is not None:
-            window_start = (
-                pd.Timestamp(cutoff) - timedelta(days=RELOAD_TRAILING_DAYS)
-            )
+            window_start = cutoff - timedelta(days=RELOAD_TRAILING_DAYS)
             df = df[df['Date'] >= window_start]
 
-    rows = _prepare_rows(df)
-    if not rows:
+    if df.empty:
         logger.info('No rows in the incremental window; nothing to load')
         return 0, 0
 
-    batch_min_date = min(r[0] for r in rows)
-    existing = set(
-        conn.execute(
-            f"SELECT {', '.join(_KEY_COLUMNS)} FROM matches WHERE date >= ?",
-            (batch_min_date,),
-        ).fetchall()
-    )
-    batch_keys = {tuple(r[i] for i in _KEY_INDICES) for r in rows}
-    updated = len(batch_keys & existing)
-    inserted = len(batch_keys) - updated
+    incoming = _prepare_df(df)
+    _assert_natural_key_unique(incoming)
 
-    with conn:
-        conn.executemany(_UPSERT_SQL, rows)
+    conn.register('incoming', incoming)
+    typed_incoming = conn.sql(f'SELECT {_TYPED_SELECT_SQL} FROM incoming')
+
+    touched_years = sorted(incoming['year'].unique().tolist())
+    inserted = updated = 0
+
+    for year in touched_years:
+        year_incoming = typed_incoming.filter(f'year = {year}')
+        conn.register('year_incoming', year_incoming)
+        existing = _existing_partition(conn, year)
+        conn.register('existing', existing)
+
+        key_cols = ' AND '.join(
+            f'e.{c} IS NOT DISTINCT FROM i.{c}' for c in _KEY_COLUMNS
+        )
+        counts = conn.execute(f"""
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE EXISTS (SELECT 1 FROM existing e WHERE {key_cols})
+                ) AS updated,
+                COUNT(*) FILTER (
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM existing e WHERE {key_cols}
+                    )
+                ) AS inserted
+            FROM year_incoming i
+        """).fetchone()
+        updated += counts[0]
+        inserted += counts[1]
+
+        kept_existing = conn.sql(f"""
+            SELECT existing.* FROM existing
+            WHERE NOT EXISTS (
+                SELECT 1 FROM year_incoming i
+                WHERE {key_cols.replace('e.', 'existing.')}
+            )
+        """)
+        combined = kept_existing.union(year_incoming)
+        _write_year_partition(conn, year, combined)
+
+        conn.unregister('year_incoming')
+        conn.unregister('existing')
+
+    conn.unregister('incoming')
 
     logger.info(
-        'Loaded %d rows: %d inserted, %d updated', len(rows), inserted, updated
+        'Loaded %d rows across %d partition(s) (%s) in %.2fs: '
+        '%d inserted, %d updated',
+        len(incoming), len(touched_years), touched_years,
+        time.monotonic() - t0, inserted, updated,
     )
     return inserted, updated
 
@@ -151,7 +259,7 @@ def main() -> None:
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',
     )
     parser = argparse.ArgumentParser(
-        description='Transform + load the raw CSV into SQLite.'
+        description='Transform + load the raw CSV into partitioned Parquet.'
     )
     parser.add_argument(
         '--full-refresh', action='store_true',

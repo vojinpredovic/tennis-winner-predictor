@@ -6,6 +6,7 @@ DATA_DIR = PROJECT_ROOT / 'data'
 RAW_DIR = DATA_DIR / 'raw'
 RAW_CSV_PATH = RAW_DIR / 'atp_tennis.csv'
 DB_PATH = DATA_DIR / 'tennis.db'
+MATCHES_DIR = DATA_DIR / 'matches'
 
 KAGGLE_DATASET = 'dissfya/atp-tennis-2000-2023daily-pull'
 KAGGLE_CSV_MEMBER = 'atp_tennis.csv'

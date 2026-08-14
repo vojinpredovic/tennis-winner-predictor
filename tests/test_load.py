@@ -1,13 +1,13 @@
-import sqlite3
-
+import duckdb
 import pandas as pd
 import pytest
 
+import pipeline.load as load_module
 from pipeline.load import load
 
 
-def _sample_df(n=3):
-    dates = pd.date_range('2024-01-01', periods=n, freq='D')
+def _sample_df(n=3, year=2024):
+    dates = pd.date_range(f'{year}-01-01', periods=n, freq='D')
     return pd.DataFrame({
         'Date': dates,
         'Tournament': [f'Event {i}' for i in range(n)],
@@ -34,25 +34,70 @@ def _sample_df(n=3):
 
 
 @pytest.fixture
+def matches_dir(tmp_path, monkeypatch):
+    """Point pipeline.load at a scratch directory instead of data/matches."""
+    d = tmp_path / 'matches'
+    monkeypatch.setattr(load_module, 'MATCHES_DIR', d)
+    return d
+
+
+@pytest.fixture
 def conn():
-    connection = sqlite3.connect(':memory:')
+    connection = duckdb.connect()
     yield connection
     connection.close()
 
 
-def test_load_is_idempotent(conn):
+def _row_count(matches_dir) -> int:
+    if not any(matches_dir.glob('year=*/*.parquet')):
+        return 0
+    pattern = str(matches_dir / '**' / '*.parquet')
+    with duckdb.connect() as c:
+        return c.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{pattern}', "
+            'hive_partitioning=true)'
+        ).fetchone()[0]
+
+
+def _partition_rows(matches_dir, year) -> int:
+    pattern = str(matches_dir / f'year={year}' / '*.parquet')
+    with duckdb.connect() as c:
+        return c.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{pattern}')"
+        ).fetchone()[0]
+
+
+def test_load_is_idempotent(matches_dir, conn):
     df = _sample_df()
 
     inserted, updated = load(df, conn, full_refresh=True)
     assert (inserted, updated) == (3, 0)
-    assert conn.execute('SELECT COUNT(*) FROM matches').fetchone()[0] == 3
+    assert _row_count(matches_dir) == 3
 
     inserted, updated = load(df, conn, full_refresh=True)
     assert (inserted, updated) == (0, 3)
-    assert conn.execute('SELECT COUNT(*) FROM matches').fetchone()[0] == 3
+    assert _row_count(matches_dir) == 3
 
 
-def test_load_upsert_updates_changed_values_in_place(conn):
+def test_partitions_created_per_year_with_expected_row_counts(
+    matches_dir, conn
+):
+    df = pd.concat(
+        [_sample_df(n=2, year=2022), _sample_df(n=3, year=2023)],
+        ignore_index=True,
+    )
+
+    load(df, conn, full_refresh=True)
+
+    assert (matches_dir / 'year=2022').is_dir()
+    assert (matches_dir / 'year=2023').is_dir()
+    assert not (matches_dir / 'year=2024').exists()
+    assert _partition_rows(matches_dir, 2022) == 2
+    assert _partition_rows(matches_dir, 2023) == 3
+    assert _row_count(matches_dir) == 5
+
+
+def test_load_upsert_updates_changed_values_in_place(matches_dir, conn):
     df = _sample_df()
     load(df, conn, full_refresh=True)
 
@@ -62,14 +107,34 @@ def test_load_upsert_updates_changed_values_in_place(conn):
     inserted, updated = load(changed, conn, full_refresh=True)
 
     assert (inserted, updated) == (0, 3)
-    assert conn.execute('SELECT COUNT(*) FROM matches').fetchone()[0] == 3
+    assert _row_count(matches_dir) == 3
+
+    pattern = str(matches_dir / '**' / '*.parquet')
     row = conn.execute(
-        'SELECT winner, score FROM matches WHERE tournament = ?', ('Event 0',)
+        f"SELECT winner, score FROM read_parquet('{pattern}', "
+        "hive_partitioning=true) WHERE tournament = 'Event 0'"
     ).fetchone()
     assert row == (changed.loc[0, 'Player_2'], '3-6 4-6')
 
 
-def test_load_treats_same_day_rematch_as_two_distinct_rows(conn):
+def test_natural_key_uniqueness_assertion_fires_on_duplicate_input(
+    matches_dir, conn
+):
+    df = _sample_df(n=2)
+    # Force a natural-key collision: same date/tournament/round/players.
+    df.loc[1, ['Date', 'Tournament', 'Round', 'Player_1', 'Player_2']] = (
+        df.loc[0, ['Date', 'Tournament', 'Round', 'Player_1', 'Player_2']]
+    )
+
+    with pytest.raises(ValueError, match='duplicate natural key'):
+        load(df, conn, full_refresh=True)
+
+    assert _row_count(matches_dir) == 0
+
+
+def test_load_treats_same_day_rematch_as_two_distinct_rows(
+    matches_dir, conn
+):
     # Same two players, same date, same tournament, different round -- a
     # round-robin-then-final scenario. Without `round` in the natural key
     # these would collide and one match would silently overwrite the other.
@@ -99,4 +164,4 @@ def test_load_treats_same_day_rematch_as_two_distinct_rows(conn):
 
     inserted, updated = load(df, conn, full_refresh=True)
     assert (inserted, updated) == (2, 0)
-    assert conn.execute('SELECT COUNT(*) FROM matches').fetchone()[0] == 2
+    assert _row_count(matches_dir) == 2

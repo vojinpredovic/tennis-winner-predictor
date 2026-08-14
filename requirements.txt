@@ -2,3 +2,5 @@ pandas
 scikit-learn
 kaggle
 pytest
+duckdb
+pyarrow
